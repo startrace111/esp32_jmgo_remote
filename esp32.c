@@ -18,7 +18,7 @@
 #define BUTTON_PIN 9   // BOOT 按键
 #define LED1 12
 #define LED2 13
-
+#define MQTT_MAX_PACKET_SIZE 512
 Preferences prefs;
 WebServer server(80);
 bool configFinished = false;
@@ -524,12 +524,26 @@ bool check_tcp_status() {
   return true;
 }
 
+
 void reconnect() {
   while (!mqttClient.connected()) {
     Serial.print("Attempting MQTT connection...");
-    if (mqttClient.connect("ESP32Client", mqtt_user.c_str(), mqtt_password.c_str())) {
+
+    // 设置LWT：offline
+    if (mqttClient.connect("esp32_projector_remote", mqtt_user.c_str(), mqtt_password.c_str(),
+        "homeassistant/sensor/esp32_projector_remote/status", 1, true, "offline")) {
+
       Serial.println("connected");
       mqttClient.subscribe(mqtt_command_topic.c_str());
+      delay(500);  // 等MQTT连接完全稳定
+      setup_mqtt_entities();  // 注册实体
+
+
+      // 上线 birth 消息：online
+      bool success = mqttClient.publish("homeassistant/sensor/esp32_projector_remote/status", "online", true);
+      Serial.printf("Publish to homeassistant/sensor/esp32_projector_remote/status (%s)\n", success ? "OK" : "FAIL");
+
+
     } else {
       Serial.print("failed, rc=");
       Serial.print(mqttClient.state());
@@ -602,7 +616,88 @@ void setLeds(bool on) {
   digitalWrite(LED2, on ? HIGH : LOW);
 }
 
+void setup_mqtt_entities() {
+  Serial.println("Registering MQTT entities...");
+  // 1. 开关实体（带状态反馈）
+  String payload =
+  "{"
+    "\"name\": \"投影仪电源\","
+    "\"command_topic\": \"homeassistant/switch/tv_switch/set\","
+    "\"state_topic\": \"homeassistant/switch/tv_switch/state\","
+    "\"payload_on\": \"ON\","
+    "\"payload_off\": \"OFF\","
+    "\"unique_id\": \"projector_power_switch\","
+    "\"device\": {"
+      "\"identifiers\": [\"esp32_projector_remote\"],"
+      "\"name\": \"ESP32 投影遥控器\","
+      "\"manufacturer\": \"DIY\","
+      "\"model\": \"ESP32-C3\""
+    "}"
+  "}";
+  mqttClient.publish("homeassistant/switch/tv_power/config", payload.c_str(), true);
 
+
+    // 2. 状态传感器实体（只读）
+    mqttClient.publish("homeassistant/binary_sensor/projector_power_status/config",
+        "{"
+            "\"name\": \"投影仪状态\","
+            "\"state_topic\": \"homeassistant/switch/tv_switch/state\","
+            "\"payload_on\": \"ON\","
+            "\"payload_off\": \"OFF\","
+            "\"device_class\": \"power\","
+            "\"unique_id\": \"projector_power_status\","
+            "\"device\": {"
+                "\"identifiers\": [\"esp32_projector_remote\"],"
+                "\"name\": \"ESP32 投影遥控器\","
+                "\"manufacturer\": \"DIY\","
+                "\"model\": \"ESP32-C3\""
+            "}"
+        "}", true);
+
+    // 3. 按钮类实体（多个）—— 示例中写几个，其他类似复制添加
+    const char* buttons[] = {"volume_low", "volume_mid", "volume_max", "power", "mongo",
+                             "return", "setting", "ok", "up", "down", "left", "right", "option"};
+
+    for (int i = 0; i < sizeof(buttons)/sizeof(buttons[0]); i++) {
+        char topic[128];
+        snprintf(topic, sizeof(topic), "homeassistant/button/%s/config", buttons[i]);
+
+        char payload[512];
+        snprintf(payload, sizeof(payload),
+            "{"
+                "\"name\": \"%s\","
+                "\"command_topic\": \"homeassistant/switch/tv_switch/set\","
+                "\"payload_press\": \"%s\","
+                "\"unique_id\": \"%s_button\","
+                "\"device\": {"
+                    "\"identifiers\": [\"esp32_projector_remote\"],"
+                    "\"name\": \"ESP32 投影遥控器\","
+                    "\"manufacturer\": \"DIY\","
+                    "\"model\": \"ESP32-C3\""
+                "}"
+            "}",
+            buttons[i], buttons[i], buttons[i]);
+
+        mqttClient.publish(topic, payload, true);
+    }
+
+    // 4. 在线状态监控（LWT传感器）
+    mqttClient.publish("homeassistant/binary_sensor/esp32_projector_remote_status/config",
+        "{"
+            "\"name\": \"遥控器在线状态\","
+            "\"state_topic\": \"homeassistant/sensor/esp32_projector_remote/status\","
+            "\"payload_on\": \"online\","
+            "\"payload_off\": \"offline\","
+            "\"device_class\": \"connectivity\","
+            "\"unique_id\": \"esp32_remote_online_status\","
+            "\"device\": {"
+                "\"identifiers\": [\"esp32_projector_remote\"],"
+                "\"name\": \"ESP32 投影遥控器\","
+                "\"manufacturer\": \"DIY\","
+                "\"model\": \"ESP32-C3\""
+            "}"
+        "}", true);
+}
 
 // ========= 主程序 ==========
 void startMainProgram() {
@@ -616,6 +711,7 @@ void startMainProgram() {
   // mqtt配置
   mqttClient.setServer(mqtt_server.c_str(), 1883);
   mqttClient.setCallback(callback);
+  reconnect();
 }
 
 // ========= 初始化 ==========
@@ -641,6 +737,7 @@ void setup() {
   if (enterConfig) {
     startConfigPortal();
   } else {
+    configFinished = true;
     digitalWrite(LED1, HIGH);
     digitalWrite(LED2, HIGH);
     startMainProgram();
@@ -671,4 +768,4 @@ void loop() {
   }
 }
 
-//todo: 初始化信息配置，HA控制界面，多电视控制，esp模块化集成别的功能
+//todo:多电视控制，esp模块化集成别的功能
